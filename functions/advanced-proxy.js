@@ -10,17 +10,9 @@ export async function onRequest({ request }) {
       });
     }
 
-    const parsedTargetUrl = new URL(targetUrl);
-    const targetOrigin = parsedTargetUrl.origin;
-    const targetPath = parsedTargetUrl.pathname;
-    const targetHost = parsedTargetUrl.host;
-
     console.log(`高级代理请求: ${targetUrl}`);
 
-    // 判断是否是资源文件请求
-    const resourceExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.svg', '.css', '.js', '.woff', '.woff2', '.ttf', '.eot'];
-    const isDirectResource = resourceExtensions.some(ext => targetUrl.toLowerCase().endsWith(ext));
-
+    // 请求目标网站
     const headers = new Headers();
     const forwardHeaders = [
       'user-agent',
@@ -38,6 +30,7 @@ export async function onRequest({ request }) {
       }
     });
 
+    // 发起请求
     const targetRequest = new Request(targetUrl, {
       method: request.method,
       headers: headers,
@@ -47,6 +40,7 @@ export async function onRequest({ request }) {
 
     const response = await fetch(targetRequest);
 
+    // 处理响应头
     const responseHeaders = new Headers();
     for (const [key, value] of response.headers.entries()) {
       if (!['content-encoding', 'content-length', 'connection', 'transfer-encoding'].includes(key.toLowerCase())) {
@@ -57,17 +51,21 @@ export async function onRequest({ request }) {
     responseHeaders.set('Access-Control-Allow-Origin', '*');
     responseHeaders.set('X-Proxied-By', 'EdgeOne-Pages-Advanced-Proxy');
 
+    // 处理响应内容
     const contentType = response.headers.get('content-type') || '';
     
-    // 如果是HTML内容且不是直接资源请求，处理内部链接
-    if (contentType.includes('text/html') && !isDirectResource) {
+    // 判断是否是HTML内容
+    if (contentType.includes('text/html')) {
       let html = await response.text();
       
       const requestUrl = new URL(request.url);
       const proxyBase = `${requestUrl.protocol}//${requestUrl.host}/advanced-proxy?url=`;
       
-      // 传递更多信息到替换函数
-      html = replaceLinks(html, targetOrigin, proxyBase, targetPath, targetHost);
+      // 解析原始URL，以便正确替换链接
+      const parsedTargetUrl = new URL(targetUrl);
+      
+      // 替换HTML中的链接
+      html = replaceLinksImproved(html, parsedTargetUrl, proxyBase);
       
       responseHeaders.set('Content-Type', 'text/html; charset=UTF-8');
       return new Response(html, {
@@ -76,6 +74,7 @@ export async function onRequest({ request }) {
         headers: responseHeaders
       });
     } else {
+      // 对于非HTML内容，直接返回
       const body = await response.arrayBuffer();
       return new Response(body, {
         status: response.status,
@@ -96,63 +95,63 @@ export async function onRequest({ request }) {
 }
 
 /**
- * 替换HTML中的链接，使其通过代理访问
+ * 改进的链接替换函数
  * @param {string} html - HTML内容
- * @param {string} targetOrigin - 目标网站的origin
+ * @param {URL} targetUrl - 目标URL对象
  * @param {string} proxyBase - 代理基础URL
- * @param {string} targetPath - 目标网站的路径
- * @param {string} targetHost - 目标网站的主机名
  * @returns {string} - 替换链接后的HTML
  */
-function replaceLinks(html, targetOrigin, proxyBase, targetPath, targetHost) {
+function replaceLinksImproved(html, targetUrl, proxyBase) {
+  const targetOrigin = targetUrl.origin;
+  const targetHost = targetUrl.host;
+  const targetPath = targetUrl.pathname;
+  
   // 获取当前目录路径（用于相对路径解析）
   const currentDir = targetPath.substring(0, targetPath.lastIndexOf('/') + 1);
   
-  // 提取targetHost的主域名部分（用于判断子域名）
-  const mainDomainParts = targetHost.split('.');
-  const mainDomain = mainDomainParts.length >= 2 ? 
-    `${mainDomainParts[mainDomainParts.length-2]}.${mainDomainParts[mainDomainParts.length-1]}` : 
-    targetHost;
-
-  // 替换绝对路径链接 (href="http://example.com/page")
+  // 1. 替换绝对URL (href="http://example.com/page")
   html = html.replace(/(href|src)=(["'])(https?:\/\/[^"']+)(["'])/gi, (match, attr, quote1, url, quote2) => {
-    // 避免重复代理已经是代理URL的链接
+    // 避免重复处理已经是代理URL的链接
     if (url.includes('/advanced-proxy?url=')) return match;
     return `${attr}=${quote1}${proxyBase}${encodeURIComponent(url)}${quote2}`;
   });
+  
+  // 2. 替换以//开头的协议相对URL (href="//example.com/page")
+  html = html.replace(/(href|src)=(["'])\/\/([^"']+)(["'])/gi, (match, attr, quote1, url, quote2) => {
+    const absoluteUrl = `${targetUrl.protocol}//${url}`;
+    return `${attr}=${quote1}${proxyBase}${encodeURIComponent(absoluteUrl)}${quote2}`;
+  });
 
-  // 替换根相对路径链接 (href="/page")
+  // 3. 替换根相对路径 (href="/page")
   html = html.replace(/(href|src)=(["'])(\/[^"']*)(["'])/gi, (match, attr, quote1, path, quote2) => {
     return `${attr}=${quote1}${proxyBase}${encodeURIComponent(targetOrigin + path)}${quote2}`;
   });
 
-  // 替换相对路径链接 (href="page" 或 href="./page")
-  html = html.replace(/(href|src)=(["'])(?!https?:\/\/)(?!\/)(?!#)(?!javascript:)(?!data:)([^"']+)(["'])/gi, (match, attr, quote1, path, quote2) => {
-    // 如果路径以./开头，移除./
-    if (path.startsWith('./')) {
-      path = path.substring(2);
-    }
-    
-    // 检查是否包含子域名模式 (如 "subdomain.example.com/path")
-    if (path.includes('.') && path.includes('/') && !path.startsWith('.')) {
-      const potentialDomain = path.split('/')[0];
-      if (potentialDomain.includes('.') && (potentialDomain.endsWith(mainDomain) || potentialDomain.includes('.'))) {
-        // 这可能是一个子域名链接，应该作为绝对URL处理
-        return `${attr}=${quote1}${proxyBase}${encodeURIComponent('https://' + path)}${quote2}`;
+  // 4. 替换相对路径 (href="page" 或 href="./page")
+  html = html.replace(/(href|src)=(["'])(?!https?:\/\/)(?!\/\/)(?!\/)(?!#)(?!javascript:)(?!data:)([^"']+)(["'])/gi, 
+    (match, attr, quote1, path, quote2) => {
+      // 如果路径以./开头，移除./
+      if (path.startsWith('./')) {
+        path = path.substring(2);
       }
+      
+      // 构建完整URL
+      let fullUrl;
+      if (path.startsWith('?')) {
+        // 查询参数，添加到当前页面路径
+        fullUrl = targetOrigin + targetPath + path;
+      } else {
+        // 构建相对路径URL
+        fullUrl = targetOrigin + (currentDir + path).replace(/\/\.?\//g, '/').replace(/\/+/g, '/');
+      }
+      
+      return `${attr}=${quote1}${proxyBase}${encodeURIComponent(fullUrl)}${quote2}`;
     }
-    
-    // 正常处理相对路径
-    const fullUrl = path.startsWith('?') 
-      ? targetOrigin + targetPath + path 
-      : targetOrigin + (currentDir + path).replace(/\/\.?\//g, '/').replace(/\/+/g, '/');
-    
-    return `${attr}=${quote1}${proxyBase}${encodeURIComponent(fullUrl)}${quote2}`;
-  });
+  );
 
-  // 替换CSS中的URL
+  // 5. 替换CSS中的url()
   html = html.replace(/url\((["']?)([^)'"]+)(["']?)\)/gi, (match, quote1, url, quote2) => {
-    // 不替换数据URL、锚点和已代理的URL
+    // 跳过不需要处理的URL类型
     if (url.startsWith('data:') || url.startsWith('#') || url.includes('/advanced-proxy?url=')) {
       return match;
     }
@@ -160,70 +159,59 @@ function replaceLinks(html, targetOrigin, proxyBase, targetPath, targetHost) {
     // 处理不同类型的URL
     let fullUrl;
     
-    // 处理绝对URL
+    // 绝对URL
     if (url.match(/^https?:\/\//i)) {
       fullUrl = url;
     }
-    // 处理根相对路径
+    // 协议相对URL
+    else if (url.startsWith('//')) {
+      fullUrl = `${targetUrl.protocol}${url}`;
+    }
+    // 根相对路径
     else if (url.startsWith('/')) {
       fullUrl = targetOrigin + url;
     }
-    // 检查是否是潜在的子域名路径
-    else if (url.includes('.') && url.includes('/') && !url.startsWith('.')) {
-      const potentialDomain = url.split('/')[0];
-      if (potentialDomain.includes('.') && (potentialDomain.endsWith(mainDomain) || potentialDomain.includes('.'))) {
-        // 子域名处理，假设是HTTPS
-        fullUrl = 'https://' + url;
-      } else {
-        // 普通相对路径
-        if (url.startsWith('./')) url = url.substring(2);
-        fullUrl = targetOrigin + (currentDir + url).replace(/\/\.?\//g, '/').replace(/\/+/g, '/');
-      }
-    }
-    // 处理普通相对路径
+    // 普通相对路径
     else {
-      if (url.startsWith('./')) url = url.substring(2);
+      // 移除./前缀
+      if (url.startsWith('./')) {
+        url = url.substring(2);
+      }
+      
+      // 构建完整URL
       fullUrl = targetOrigin + (currentDir + url).replace(/\/\.?\//g, '/').replace(/\/+/g, '/');
     }
     
     return `url(${quote1}${proxyBase}${encodeURIComponent(fullUrl)}${quote2})`;
   });
 
-  // 替换内联样式中的背景图片链接
-  html = html.replace(/style=(["'])[^"']*background-image:\s*url\((["']?)([^)'"]+)(["']?)\)[^"']*(["'])/gi, 
-    (match, quote1, imgQuote1, url, imgQuote2, quote2) => {
-      if (url.startsWith('data:') || url.startsWith('#') || url.includes('/advanced-proxy?url=')) {
-        return match;
-      }
-
-      let fullUrl;
-      // 处理绝对URL
-      if (url.match(/^https?:\/\//i)) {
-        fullUrl = url;
-      }
-      // 处理根相对路径
-      else if (url.startsWith('/')) {
-        fullUrl = targetOrigin + url;
-      }
-      // 检查子域名模式
-      else if (url.includes('.') && url.includes('/') && !url.startsWith('.')) {
-        const potentialDomain = url.split('/')[0];
-        if (potentialDomain.includes('.') && (potentialDomain.endsWith(mainDomain) || potentialDomain.includes('.'))) {
-          fullUrl = 'https://' + url;
-        } else {
-          if (url.startsWith('./')) url = url.substring(2);
-          fullUrl = targetOrigin + (currentDir + url).replace(/\/\.?\//g, '/').replace(/\/+/g, '/');
-        }
-      }
-      // 处理普通相对路径
-      else {
-        if (url.startsWith('./')) url = url.substring(2);
-        fullUrl = targetOrigin + (currentDir + url).replace(/\/\.?\//g, '/').replace(/\/+/g, '/');
-      }
-
-      return match.replace(url, `${proxyBase}${encodeURIComponent(fullUrl)}`);
+  // 6. 替换表单action属性
+  html = html.replace(/action=(["'])(https?:\/\/[^"']+|\/[^"']+|[^"':]+)(["'])/gi, (match, quote1, url, quote2) => {
+    // 跳过已经是代理URL的链接
+    if (url.includes('/advanced-proxy?url=')) return match;
+    
+    let fullUrl;
+    
+    // 绝对URL
+    if (url.match(/^https?:\/\//i)) {
+      fullUrl = url;
     }
-  );
+    // 根相对路径
+    else if (url.startsWith('/')) {
+      fullUrl = targetOrigin + url;
+    }
+    // 普通相对路径
+    else {
+      // 移除./前缀
+      if (url.startsWith('./')) {
+        url = url.substring(2);
+      }
+      
+      fullUrl = targetOrigin + (currentDir + url).replace(/\/\.?\//g, '/').replace(/\/+/g, '/');
+    }
+    
+    return `action=${quote1}${proxyBase}${encodeURIComponent(fullUrl)}${quote2}`;
+  });
 
   return html;
 } 
