@@ -18,7 +18,7 @@ const siteConfigs = {
       "*.png",
       "*.jpg",
       "*.vtt",
-      "*.css", // 屏蔽所有CSS，如果导致页面错乱可以移除此条
+      // "*.css", // 注意：暂时注释掉CSS屏蔽，因为它可能导致页面布局完全错乱。可以后续再测试打开。
       "https://*.googleapis.com/*",
       "https://*.googletagmanager.com/*",
       "https://*.recombee.com/*",
@@ -31,31 +31,27 @@ const siteConfigs = {
 
 export async function onRequest({ request }) {
   const url = new URL(request.url);
-  const siteKey = url.searchParams.get('site'); // e.g., '123av'
+  const siteKey = url.searchParams.get('site');
 
   if (!siteKey || !siteConfigs[siteKey]) {
     return new Response('缺少有效的 site 参数', { status: 400 });
   }
 
   const config = siteConfigs[siteKey];
-  // 决定实际要请求的目标URL。如果是首页，直接用配置的；否则用原始请求的url参数。
   const targetUrl = url.searchParams.get('url') || config.targetUrl;
 
   // --- 核心优化：请求拦截 ---
-  // 将 blockList 的字符串转为正则表达式，以便更灵活地匹配
   const blockPatterns = config.blockList.map(pattern => new RegExp(pattern.replace(/\*/g, '.*?')));
   for (const pattern of blockPatterns) {
     if (pattern.test(targetUrl)) {
       console.log(`[Optimized Proxy] 已拦截请求: ${targetUrl}`);
-      // 返回 204 No Content，表示请求成功但无内容返回，浏览器会忽略它
       return new Response(null, { status: 204 });
     }
   }
 
   try {
     console.log(`[Optimized Proxy] 代理请求: ${targetUrl}`);
-    
-    // --- 以下代码基本复用 advanced-proxy.js 的逻辑 ---
+
     const headers = new Headers();
     const forwardHeaders = ['user-agent', 'accept', 'accept-language', 'referer', 'cache-control'];
     forwardHeaders.forEach(header => {
@@ -72,38 +68,33 @@ export async function onRequest({ request }) {
     });
 
     const response = await fetch(targetRequest);
+    const responseHeaders = new Headers(response.headers);
 
-    const responseHeaders = new Headers();
-    for (const [key, value] of response.headers.entries()) {
-      if (!['content-encoding', 'content-length', 'connection', 'transfer-encoding'].includes(key.toLowerCase())) {
-        responseHeaders.set(key, value);
-      }
-    }
+    // 清理可能引起冲突的头
+    responseHeaders.delete('content-encoding');
+    responseHeaders.delete('content-length');
+    responseHeaders.delete('connection');
+    responseHeaders.delete('transfer-encoding');
 
     responseHeaders.set('Access-Control-Allow-Origin', '*');
     responseHeaders.set('X-Proxied-By', 'EdgeOne-Pages-Optimized-Proxy');
 
-    const contentType = response.headers.get('content-type') || '';
-    
+    const contentType = responseHeaders.get('content-type') || '';
+
     if (contentType.includes('text/html')) {
       let html = await response.text();
-      
-      // 注意：这里的 proxyBase 必须指向我们自己这个函数
       const proxyBase = `${url.protocol}//${url.host}/optimized-proxy?site=${siteKey}&url=`;
-      
       const parsedTargetUrl = new URL(targetUrl);
       
       html = replaceLinksImproved(html, parsedTargetUrl, proxyBase);
       
-      responseHeaders.set('Content-Type', 'text/html; charset=UTF-8');
       return new Response(html, {
         status: response.status,
         statusText: response.statusText,
         headers: responseHeaders
       });
     } else {
-      const body = await response.arrayBuffer();
-      return new Response(body, {
+      return new Response(response.body, {
         status: response.status,
         statusText: response.statusText,
         headers: responseHeaders
@@ -116,63 +107,62 @@ export async function onRequest({ request }) {
 }
 
 /**
- * 链接替换函数 (直接从 advanced-proxy.js 复制过来即可)
+ * 链接替换函数 (修正后的版本)
  * @param {string} html - HTML内容
  * @param {URL} targetUrl - 目标URL对象
  * @param {string} proxyBase - 代理基础URL
  * @returns {string} - 替换链接后的HTML
  */
 function replaceLinksImproved(html, targetUrl, proxyBase) {
-  // ... 此处省略，请将 advanced-proxy.js 中的 replaceLinksImproved 函数完整地复制到这里 ...
   const targetOrigin = targetUrl.origin;
-  const targetHost = targetUrl.host;
   const targetPath = targetUrl.pathname;
   const currentDir = targetPath.substring(0, targetPath.lastIndexOf('/') + 1);
-  html = html.replace(/(href|src)=(["'])(https?:\/\/[^"']+)(["'])/gi, (match, attr, quote1, url, quote2) => {
-    if (url.includes('/optimized-proxy?')) return match;
-    return `${attr}=${quote1}${proxyBase}${encodeURIComponent(url)}${quote2}`;
+
+  const replacer = (regex, processor) => {
+    html = html.replace(regex, (match, ...args) => {
+      // 提取URL部分
+      const urlPart = args.find(arg => typeof arg === 'string' && arg.includes(match.match(/(href|src|action|url\()(["']?)([^)"']+)/)[3]));
+      if (!urlPart || urlPart.startsWith('data:') || urlPart.startsWith('#') || urlPart.startsWith('javascript:')) {
+        return match;
+      }
+       // 检查是否已经是代理链接
+      if (urlPart.includes('/optimized-proxy?')) {
+        return match;
+      }
+      return processor(match, ...args);
+    });
+  };
+
+  // 1. 替换绝对和协议相对URL (href="http://...", href="//...")
+  replacer(/(href|src|action)=(["'])(https?:)?\/\/([^"']+)(["'])/gi, (match, attr, quote1, protocol, url, quote2) => {
+    const fullUrl = `${protocol || targetUrl.protocol}//${url}`;
+    return `${attr}=${quote1}${proxyBase}${encodeURIComponent(fullUrl)}${quote2}`;
   });
-  html = html.replace(/(href|src)=(["'])\/\/([^"']+)(["'])/gi, (match, attr, quote1, url, quote2) => {
-    const absoluteUrl = `${targetUrl.protocol}//${url}`;
-    return `${attr}=${quote1}${proxyBase}${encodeURIComponent(absoluteUrl)}${quote2}`;
-  });
-  html = html.replace(/(href|src)=(["'])(\/[^"']*)(["'])/gi, (match, attr, quote1, path, quote2) => {
+
+  // 2. 替换根相对路径 (href="/page")
+  replacer(/(href|src|action)=(["'])(\/[^/][^"']*)(["'])/gi, (match, attr, quote1, path, quote2) => {
     return `${attr}=${quote1}${proxyBase}${encodeURIComponent(targetOrigin + path)}${quote2}`;
   });
-  html = html.replace(/(href|src)=(["'])(?!https?:\/\/)(?!\/\/)(?!\/)(?!#)(?!javascript:)(?!data:)([^"']+)(["'])/gi, 
-    (match, attr, quote1, path, quote2) => {
-      if (path.startsWith('./')) { path = path.substring(2); }
-      let fullUrl;
-      if (path.startsWith('?')) {
-        fullUrl = targetOrigin + targetPath + path;
-      } else {
-        fullUrl = targetOrigin + (currentDir + path).replace(/\/\.?\//g, '/').replace(/\/+/g, '/');
-      }
-      return `${attr}=${quote1}${proxyBase}${encodeURIComponent(fullUrl)}${quote2}`;
-    }
-  );
-  html = html.replace(/url\((["']?)([^)'"]+)(["']?)\)/gi, (match, quote1, url, quote2) => {
-    if (url.startsWith('data:') || url.startsWith('#') || url.includes('/optimized-proxy?')) { return match; }
+
+  // 3. 替换相对路径 (href="page", href="./page")
+  replacer(/(href|src|action)=(["'])(?!\/|#|javascript:|data:)([^"':]+)(["'])/gi, (match, attr, quote1, path, quote2) => {
+    let resolvedPath = path.startsWith('./') ? path.substring(2) : path;
+    const fullUrl = new URL(resolvedPath, targetUrl.href).href;
+    return `${attr}=${quote1}${proxyBase}${encodeURIComponent(fullUrl)}${quote2}`;
+  });
+
+  // 4. 替换CSS中的url()
+  replacer(/url\((["']?)([^)'"]+)(["']?)\)/gi, (match, quote1, url, quote2) => {
     let fullUrl;
-    if (url.match(/^https?:\/\//i)) { fullUrl = url; }
-    else if (url.startsWith('//')) { fullUrl = `${targetUrl.protocol}${url}`; }
-    else if (url.startsWith('/')) { fullUrl = targetOrigin + url; }
-    else {
-      if (url.startsWith('./')) { url = url.substring(2); }
-      fullUrl = targetOrigin + (currentDir + url).replace(/\/\.?\//g, '/').replace(/\/+/g, '/');
+    if (url.match(/^(https?:)?\/\//)) {
+      fullUrl = new URL(url, targetUrl.protocol + '//').href;
+    } else if (url.startsWith('/')) {
+      fullUrl = targetOrigin + url;
+    } else {
+      fullUrl = new URL(url, targetUrl.href).href;
     }
     return `url(${quote1}${proxyBase}${encodeURIComponent(fullUrl)}${quote2})`;
   });
-  html = html.replace(/action=(["'])(https?:\/\/[^"']+|\/[^"']+|[^"':]+)(["'])/gi, (match, quote1, url, quote2) => {
-    if (url.includes('/optimized-proxy?')) return match;
-    let fullUrl;
-    if (url.match(/^https?:\/\//i)) { fullUrl = url; }
-    else if (url.startsWith('/')) { fullUrl = targetOrigin + url; }
-    else {
-      if (url.startsWith('./')) { url = url.substring(2); }
-      fullUrl = targetOrigin + (currentDir + url).replace(/\/\.?\//g, '/').replace(/\/+/g, '/');
-    }
-    return `action=${quote1}${proxyBase}${encodeURIComponent(fullUrl)}${quote2}`;
-  });
+
   return html;
 }
